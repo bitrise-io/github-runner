@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -84,6 +84,9 @@ namespace GitHub.Runner.Worker.Handlers
                     Environment["ACTIONS_ORCHESTRATION_ID"] = orchestrationId;
                 }
             }
+
+            // Apply Cache URL overrides
+            CacheEnvironmentHelper.OverrideCacheEnvironment(Environment);
 
             // Resolve the target script.
             string target = null;
