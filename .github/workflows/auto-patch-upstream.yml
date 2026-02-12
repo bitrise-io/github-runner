@@ -1,0 +1,129 @@
+name: Auto-patch upstream runner tags
+
+on:
+  schedule:
+    - cron: '0 6 * * *' # daily at 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo with full history and tags
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Sync upstream tags
+        run: |
+          git remote add upstream https://github.com/actions/runner.git
+          git fetch upstream 'refs/tags/*:refs/tags/upstream/*'
+
+      - name: Save patch assets
+        run: |
+          # Copy CacheEnvironmentHelper.cs source to RUNNER_TEMP so it survives detached checkouts
+          cp CacheEnvironmentHelper.cs "${RUNNER_TEMP}/CacheEnvironmentHelper.cs"
+
+      - name: Find and patch new tags
+        run: |
+          git config user.name "bitrise-bot"
+          git config user.email "bot@bitrise.io"
+
+          # Collect all upstream v* tags
+          UPSTREAM_TAGS=$(git tag -l 'upstream/v*' | sed 's|^upstream/||' | sort -V)
+
+          PATCHED=0
+          FAILED=0
+          SKIPPED=0
+
+          for TAG in $UPSTREAM_TAGS; do
+            PATCHED_TAG="${TAG}-bitrise"
+
+            # Check if we already have this patched tag
+            if git rev-parse "refs/tags/${PATCHED_TAG}" >/dev/null 2>&1; then
+              SKIPPED=$((SKIPPED + 1))
+              continue
+            fi
+
+            echo "::group::Patching ${TAG} -> ${PATCHED_TAG}"
+
+            # Clean slate and checkout the upstream tag
+            git reset --hard
+            git clean -fd
+            git checkout "upstream/${TAG}" --detach 2>&1
+
+            HANDLER_DIR="src/Runner.Worker/Handlers"
+            CONTAINER_FILE="${HANDLER_DIR}/ContainerActionHandler.cs"
+            NODE_FILE="${HANDLER_DIR}/NodeScriptActionHandler.cs"
+            HELPER_FILE="${HANDLER_DIR}/CacheEnvironmentHelper.cs"
+            MARKER="CacheEnvironmentHelper.OverrideCacheEnvironment"
+
+            # Skip if the patch is already present (e.g. future upstream adoption)
+            if grep -q "${MARKER}" "${CONTAINER_FILE}" 2>/dev/null; then
+              echo "Patch already present in ${TAG} — skipping"
+              SKIPPED=$((SKIPPED + 1))
+              echo "::endgroup::"
+              continue
+            fi
+
+            # Check that anchor patterns exist
+            if ! grep -q 'foreach (var variable in this\.Environment)' "${CONTAINER_FILE}" 2>/dev/null || \
+               ! grep -q '// Resolve the target script' "${NODE_FILE}" 2>/dev/null; then
+              echo "::warning::Anchor pattern not found in ${TAG} — skipping"
+              FAILED=$((FAILED + 1))
+              echo "::endgroup::"
+              continue
+            fi
+
+            # 1. Create CacheEnvironmentHelper.cs from the patch file
+            cp "${RUNNER_TEMP}/CacheEnvironmentHelper.cs" "${HELPER_FILE}"
+
+            # 2. Insert cache override call into ContainerActionHandler.cs
+            #    Anchor: "foreach (var variable in this.Environment)"
+            awk '/foreach \(var variable in this\.Environment\)/{
+              print "            // Apply Cache URL overrides"
+              print "            CacheEnvironmentHelper.OverrideCacheEnvironment(Environment);"
+              print ""
+            }1' "${CONTAINER_FILE}" > tmp && mv tmp "${CONTAINER_FILE}"
+
+            # 3. Insert cache override call into NodeScriptActionHandler.cs
+            #    Anchor: "// Resolve the target script."
+            awk '/\/\/ Resolve the target script\./{
+              print "            // Apply Cache URL overrides"
+              print "            CacheEnvironmentHelper.OverrideCacheEnvironment(Environment);"
+              print ""
+            }1' "${NODE_FILE}" > tmp && mv tmp "${NODE_FILE}"
+
+            # 4. Remove .github/ so push doesn't require workflows permission
+            rm -rf .github/
+
+            # 5. Commit, tag, push
+            git add -A
+            git commit -m "Bitrise cache integration (patched from ${TAG})"
+
+            git tag "${PATCHED_TAG}"
+
+            if git push origin "${PATCHED_TAG}"; then
+              echo "Successfully tagged and pushed ${PATCHED_TAG}"
+              PATCHED=$((PATCHED + 1))
+            else
+              echo "::warning::Push failed for ${PATCHED_TAG}"
+              FAILED=$((FAILED + 1))
+            fi
+
+            echo "::endgroup::"
+          done
+
+          echo ""
+          echo "=== Summary ==="
+          echo "Patched: ${PATCHED}"
+          echo "Skipped (already exist): ${SKIPPED}"
+          echo "Failed: ${FAILED}"
+
+          if [ "${FAILED}" -gt 0 ]; then
+            echo "::warning::${FAILED} tag(s) failed to patch. Check the log above for details."
+          fi
