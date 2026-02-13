@@ -284,6 +284,7 @@ jobs:
         asset_content_type: application/octet-stream
 
   publish-image:
+    if: false
     needs: release
     runs-on: ubuntu-latest
     permissions:
