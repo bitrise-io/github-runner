@@ -58,6 +58,9 @@ namespace GitHub.Runner.Worker.Handlers
                 Environment["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = systemConnection.Authorization.Parameters[EndpointAuthorizationParameters.AccessToken];
             }
 
+            // Apply Cache URL overrides
+            CacheEnvironmentHelper.OverrideCacheEnvironment(Environment);
+
             // Resolve the target script.
             string target = null;
             if (stage == ActionRunStage.Main)
