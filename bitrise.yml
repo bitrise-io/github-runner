@@ -1,0 +1,195 @@
+---
+format_version: '25'
+default_step_lib_source: https://github.com/bitrise-io/bitrise-steplib.git
+project_type: other
+
+pipelines:
+  release:
+    triggers:
+      push:
+      - branch: releases/v*-bitrise
+    stages:
+    - build: {}
+    - upload-and-deploy: {}
+
+stages:
+  build:
+    workflows:
+    - build-linux: {}
+    - build-macos: {}
+  upload-and-deploy:
+    workflows:
+    - upload-release-assets: {}
+
+workflows:
+  build-linux:
+    steps:
+    - git-clone@8: {}
+    - script@1:
+        title: Build & Package runner (linux-x64)
+        inputs:
+        - content: |
+            #!/usr/bin/env bash
+            set -euo pipefail
+            cd "${BITRISE_SOURCE_DIR}/src"
+            ./dev.sh layout Release linux-x64
+            ./dev.sh package Release linux-x64
+
+            RUNNER_VERSION=$(cat runnerversion)
+            PACKAGE_PATH="${BITRISE_SOURCE_DIR}/_package/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
+
+            echo "Built package: ${PACKAGE_PATH}"
+            ls -lh "${PACKAGE_PATH}"
+
+            envman add --key LINUX_PACKAGE_PATH --value "${PACKAGE_PATH}"
+    - deploy-to-bitrise-io@2:
+        inputs:
+        - pipeline_intermediate_files: "$LINUX_PACKAGE_PATH:BITRISE_LINUX_PACKAGE_PATH"
+
+  build-macos:
+    steps:
+    - git-clone@8: {}
+    - script@1:
+        title: Build & Package runner (osx-arm64)
+        inputs:
+        - content: |
+            #!/usr/bin/env bash
+            set -euo pipefail
+            cd "${BITRISE_SOURCE_DIR}/src"
+            ./dev.sh layout Release osx-arm64
+            ./dev.sh package Release osx-arm64
+
+            RUNNER_VERSION=$(cat runnerversion)
+            PACKAGE_PATH="${BITRISE_SOURCE_DIR}/_package/actions-runner-osx-arm64-${RUNNER_VERSION}.tar.gz"
+
+            echo "Built package: ${PACKAGE_PATH}"
+            ls -lh "${PACKAGE_PATH}"
+
+            envman add --key MACOS_PACKAGE_PATH --value "${PACKAGE_PATH}"
+    - deploy-to-bitrise-io@2:
+        inputs:
+        - pipeline_intermediate_files: "$MACOS_PACKAGE_PATH:BITRISE_MACOS_PACKAGE_PATH"
+    meta:
+      bitrise.io:
+        stack: osx-xcode-26.2.x
+        machine_type_id: g2.mac.large
+
+  upload-release-assets:
+    steps:
+    - git-clone@8: {}
+    - pull-intermediate-files@1:
+        inputs:
+        - artifact_sources: ".*"
+    - script@1:
+        title: Prepare release assets
+        inputs:
+        - content: |
+            #!/usr/bin/env bash
+            set -euo pipefail
+
+            RELEASE_ASSETS_DIR="${BITRISE_SOURCE_DIR}/release-assets"
+            mkdir -p "${RELEASE_ASSETS_DIR}"
+
+            cp "${BITRISE_LINUX_PACKAGE_PATH}" "${RELEASE_ASSETS_DIR}/"
+            cp "${BITRISE_MACOS_PACKAGE_PATH}" "${RELEASE_ASSETS_DIR}/"
+
+            echo "Release assets:"
+            ls -lh "${RELEASE_ASSETS_DIR}"
+
+            RELEASE_TAG="v$(cat "${BITRISE_SOURCE_DIR}/src/runnerversion")"
+            envman add --key RELEASE_ASSETS_DIR --value "${RELEASE_ASSETS_DIR}"
+            envman add --key RELEASE_TAG --value "${RELEASE_TAG}"
+
+    - script@1:
+        title: Upload assets to R2
+        inputs:
+        - content: |
+            #!/usr/bin/env bash
+            set -euo pipefail
+
+            echo "--- Configuring AWS CLI for R2"
+
+            export AWS_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID}"
+            export AWS_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY}"
+            export AWS_DEFAULT_REGION="auto"
+
+            echo "--- Uploading assets to s3://${R2_BUCKET}/"
+
+            for file in "${RELEASE_ASSETS_DIR}"/*; do
+              FILENAME=$(basename "${file}")
+              echo "Uploading: ${FILENAME}"
+              aws s3 cp "${file}" "s3://${R2_BUCKET}/${FILENAME}" \
+                --endpoint-url "${R2_ENDPOINT}"
+            done
+
+            echo "--- Upload complete. Verifying:"
+            aws s3 ls "s3://${R2_BUCKET}/" \
+              --endpoint-url "${R2_ENDPOINT}"
+
+    - script@1:
+        title: Upload assets to GCS
+        inputs:
+        - content: |
+            #!/usr/bin/env bash
+            set -euo pipefail
+
+            echo "--- Authenticating with GCP"
+
+            echo "${GCS_SERVICE_ACCOUNT_JSON}" | base64 -d > /tmp/gcs-key.json
+            gcloud auth activate-service-account --key-file=/tmp/gcs-key.json
+
+            echo "--- Uploading assets to gs://${GCS_BUCKET}/"
+
+            gsutil -m cp "${RELEASE_ASSETS_DIR}"/* "gs://${GCS_BUCKET}/"
+
+            echo "--- Upload complete. Verifying:"
+            gsutil ls -l "gs://${GCS_BUCKET}/"
+
+            rm -f /tmp/gcs-key.json
+
+    - script@1:
+        title: Update runner version in instance-management-deployments
+        inputs:
+        - content: |
+            #!/usr/bin/env bash
+            set -euo pipefail
+
+            VERSION="${RELEASE_TAG}"
+            VERSION_NUM="${VERSION#v}"
+
+            echo "--- Computing SHA256 hashes for version ${VERSION}"
+
+            OSX_ARM64_HASH=$(sha256sum "${RELEASE_ASSETS_DIR}/actions-runner-osx-arm64-${VERSION_NUM}.tar.gz" | awk '{print $1}')
+            LINUX_X64_HASH=$(sha256sum "${RELEASE_ASSETS_DIR}/actions-runner-linux-x64-${VERSION_NUM}.tar.gz" | awk '{print $1}')
+
+            echo "osx-arm64: ${OSX_ARM64_HASH}"
+            echo "linux-x64: ${LINUX_X64_HASH}"
+
+            echo "--- Cloning instance-management-deployments"
+
+            REPO_DIR=$(mktemp -d)
+            git clone --branch staging "https://x-access-token:${GITHUB_TOKEN}@github.com/bitrise-io/instance-management-deployments.git" "${REPO_DIR}"
+
+            VERSIONS_FILE="${REPO_DIR}/instance-manager-pool-controller/files/github_runner_versions.yaml"
+
+            echo "--- Adding version ${VERSION} to ${VERSIONS_FILE}"
+
+            yq -i ".versions.\"${VERSION}\".\"osx-arm64\" = \"${OSX_ARM64_HASH}\"" "${VERSIONS_FILE}"
+            yq -i ".versions.\"${VERSION}\".\"linux-x64\" = \"${LINUX_X64_HASH}\"" "${VERSIONS_FILE}"
+
+            echo "--- Updated file content:"
+            cat "${VERSIONS_FILE}"
+
+            cd "${REPO_DIR}"
+            git config user.name "bitrise-infrabot"
+            git config user.email "bitrise-infrabot@bitrise.io"
+            git add instance-manager-pool-controller/files/github_runner_versions.yaml
+            git commit -m "Add GitHub runner ${VERSION}"
+            git push origin staging
+
+            rm -rf "${REPO_DIR}"
+
+meta:
+  bitrise.io:
+    stack: ubuntu-noble-24.04-bitrise-2025-base
+    machine_type_id: g2.linux.x-large
