@@ -72,6 +72,9 @@ namespace GitHub.Runner.Worker.Handlers
                 Environment["ACTIONS_RESULTS_URL"] = resultsUrl;
             }
 
+            // Apply Cache URL overrides
+            CacheEnvironmentHelper.OverrideCacheEnvironment(Environment);
+
             // Resolve the target script.
             string target = null;
             if (stage == ActionRunStage.Main)
