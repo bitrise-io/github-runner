@@ -39,12 +39,14 @@ jobs:
           # Minimum upstream version to process — older tags are ignored
           MIN_TAG="v2.328.0"
 
-          # Collect upstream v* tags >= MIN_TAG, newest first
+          # Collect upstream v* tags >= MIN_TAG, oldest first so a backlog is drained
+          # in ascending order — the last patched branch (which the deployment repo
+          # picks up as default via Bitrise CI) is always the newest tag.
           UPSTREAM_TAGS=$(git tag -l 'upstream/v*' | sed 's|^upstream/||' | while read -r TAG; do
             if [ "$(printf '%s\n%s\n' "$MIN_TAG" "$TAG" | sort -V | head -n1)" = "$MIN_TAG" ]; then
               echo "$TAG"
             fi
-          done | sort -rV)
+          done | sort -V)
 
           MAX_PATCHES=1
           PATCHED=0
